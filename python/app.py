@@ -244,6 +244,122 @@ class CloudPane(QtWidgets.QWidget):
             pass
 
 
+class FolderGroupDialog(QtWidgets.QDialog):
+    """Two-column, row-wise paired folder selector."""
+
+    def __init__(self, parent=None, initial_pairs=None):
+        super().__init__(parent)
+        self.setWindowTitle("Folders")
+        self.resize(820, 420)
+
+        initial_pairs = initial_pairs or []
+
+        root = QtWidgets.QVBoxLayout(self)
+
+        # ---- header ----
+        header = QtWidgets.QHBoxLayout()
+        h1 = QtWidgets.QLabel("Original Folders")
+        h2 = QtWidgets.QLabel("Annotation Folders")
+        for h in (h1, h2):
+            h.setStyleSheet("font-weight: bold")
+            h.setAlignment(QtCore.Qt.AlignCenter)
+        header.addWidget(h1)
+        header.addWidget(h2)
+        root.addLayout(header)
+
+        # ---- lists ----
+        lists = QtWidgets.QHBoxLayout()
+        self.list_orig = QtWidgets.QListWidget()
+        self.list_anno = QtWidgets.QListWidget()
+        lists.addWidget(self.list_orig)
+        lists.addWidget(self.list_anno)
+        root.addLayout(lists, 1)
+
+        # preload
+        for o, a in initial_pairs:
+            self.list_orig.addItem(o)
+            self.list_anno.addItem(a)
+
+        # ---- buttons ----
+        btns = QtWidgets.QHBoxLayout()
+        self.btn_add = QtWidgets.QPushButton("Add Pair")
+        self.btn_remove = QtWidgets.QPushButton("Remove Pair")
+        self.btn_up = QtWidgets.QPushButton("↑")
+        self.btn_down = QtWidgets.QPushButton("↓")
+        for b in (self.btn_add, self.btn_remove, self.btn_up, self.btn_down):
+            btns.addWidget(b)
+        btns.addStretch(1)
+        root.addLayout(btns)
+
+        # ---- OK / Cancel ----
+        footer = QtWidgets.QHBoxLayout()
+        footer.addStretch(1)
+        ok = QtWidgets.QPushButton("Save")
+        cancel = QtWidgets.QPushButton("Cancel")
+        footer.addWidget(ok)
+        footer.addWidget(cancel)
+        root.addLayout(footer)
+
+        # signals
+        self.btn_add.clicked.connect(self.add_pair)
+        self.btn_remove.clicked.connect(self.remove_pair)
+        self.btn_up.clicked.connect(lambda: self.move_pair(-1))
+        self.btn_down.clicked.connect(lambda: self.move_pair(+1))
+        ok.clicked.connect(self.accept)
+        cancel.clicked.connect(self.reject)
+
+        # sync selection
+        self.list_orig.currentRowChanged.connect(
+            self.list_anno.setCurrentRow
+        )
+        self.list_anno.currentRowChanged.connect(
+            self.list_orig.setCurrentRow
+        )
+
+    # ---------- actions ----------
+    def add_pair(self):
+        o = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "Select Original folder"
+        )
+        if not o:
+            return
+
+        a = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "Select Annotation folder"
+        )
+        if not a:
+            return
+
+        self.list_orig.addItem(os.path.abspath(o))
+        self.list_anno.addItem(os.path.abspath(a))
+
+    def remove_pair(self):
+        r = self.list_orig.currentRow()
+        if r >= 0:
+            self.list_orig.takeItem(r)
+            self.list_anno.takeItem(r)
+
+    def move_pair(self, delta):
+        r = self.list_orig.currentRow()
+        if r < 0:
+            return
+        nr = r + delta
+        if not (0 <= nr < self.list_orig.count()):
+            return
+
+        o = self.list_orig.takeItem(r)
+        a = self.list_anno.takeItem(r)
+        self.list_orig.insertItem(nr, o)
+        self.list_anno.insertItem(nr, a)
+        self.list_orig.setCurrentRow(nr)
+
+    def pairs(self):
+        return [
+            (self.list_orig.item(i).text(),
+             self.list_anno.item(i).text())
+            for i in range(self.list_orig.count())
+        ]
+
 # ────────── Main window ──────────
 class MainWindow(QtWidgets.QWidget):
     def __init__(self, folder_paths: List[str]):
@@ -607,20 +723,21 @@ class MainWindow(QtWidgets.QWidget):
             pass
     
     def choose_folders(self):
-        """Pick 1–4 folders at once (multi-select). No prompt at startup."""
-        dlg = QtWidgets.QFileDialog(self, "Select 1–4 folders")
-        dlg.setFileMode(QtWidgets.QFileDialog.Directory)
-        dlg.setOption(QtWidgets.QFileDialog.DontUseNativeDialog, True)  # needed for multi-select on some platforms
-        dlg.setOption(QtWidgets.QFileDialog.ShowDirsOnly, True)
+        # rebuild existing pairs from flat self.folders
+        pairs = []
+        f = self.folders
+        for i in range(0, len(f), 2):
+            if i + 1 < len(f):
+                pairs.append((f[i], f[i + 1]))
 
-        # enable multi-selection in both the list and tree views
-        for view in dlg.findChildren((QtWidgets.QListView, QtWidgets.QTreeView)):
-            view.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
-
+        dlg = FolderGroupDialog(self, initial_pairs=pairs)
         if dlg.exec_():
-            picked = dlg.selectedFiles()  # returns list of selected directories
-            if picked:
-                self.apply_new_folders(picked[:4])
+            flat = []
+            for o, a in dlg.pairs():
+                flat.extend([o, a])
+            if flat:
+                self.apply_new_folders(flat)
+
 
     def apply_new_folders(self, folders):
         self.folders = [os.path.abspath(f) for f in folders[:4]]

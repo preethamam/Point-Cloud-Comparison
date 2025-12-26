@@ -440,7 +440,7 @@ class MainWindow(QtWidgets.QWidget):
         # NEW: jump-to-index textbox
         self.edit_jump = QtWidgets.QLineEdit()
         self.edit_jump.setPlaceholderText("Input PC Index and Press Enter")
-        self.edit_jump.setFixedWidth(190)
+        self.edit_jump.setFixedWidth(158)
         self.edit_jump.setClearButtonEnabled(True)
         self.edit_jump.setFocusPolicy(QtCore.Qt.ClickFocus)
 
@@ -455,22 +455,17 @@ class MainWindow(QtWidgets.QWidget):
         center_box_layout.setContentsMargins(0, 0, 0, 0)
         center_box_layout.setSpacing(8)
 
-        # --- left group: view + reset ---
-        left_grp = QtWidgets.QHBoxLayout()
-        left_grp.setSpacing(0)
-        left_grp.addWidget(self.view_combo)
-        left_grp.addWidget(self.btn_reset)
-
-        # --- right group: loop + seconds ---
-        right_grp = QtWidgets.QHBoxLayout()
-        right_grp.setSpacing(0)
-        right_grp.addWidget(self.btn_loop)
-        right_grp.addWidget(self.spin_pause)
-        right_grp.addWidget(self.edit_jump)
+        # --- center group: view + reset + loop + seconds + jump in box---
+        center_group = QtWidgets.QHBoxLayout()
+        center_group.setSpacing(0)
+        center_group.addWidget(self.view_combo)
+        center_group.addWidget(self.btn_reset)
+        center_group.addWidget(self.btn_loop)
+        center_group.addWidget(self.spin_pause)
+        center_group.addWidget(self.edit_jump)
 
         # --- assemble ---
-        center_box_layout.addLayout(left_grp)
-        center_box_layout.addLayout(right_grp)
+        center_box_layout.addLayout(center_group)
 
         center.addWidget(center_box, alignment=QtCore.Qt.AlignHCenter)
 

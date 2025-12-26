@@ -437,13 +437,20 @@ class MainWindow(QtWidgets.QWidget):
         self.spin_pause.setFocusPolicy(QtCore.Qt.ClickFocus)   # allow clicking to type
         self.spin_pause.setKeyboardTracking(False)             # commit on Enter/focus-out
     
+        # NEW: jump-to-index textbox
+        self.edit_jump = QtWidgets.QLineEdit()
+        self.edit_jump.setPlaceholderText("Input PC Index and Press Enter")
+        self.edit_jump.setFixedWidth(190)
+        self.edit_jump.setClearButtonEnabled(True)
+        self.edit_jump.setFocusPolicy(QtCore.Qt.ClickFocus)
+
         # CENTER (fixed-width optical center)
         center = QtWidgets.QHBoxLayout()
         center.setContentsMargins(0, 0, 0, 0)
 
         # ---- fixed-width container ----
         center_box = QtWidgets.QWidget()
-        center_box.setFixedWidth(430)   # <<< key: tune once, stays perfect
+        center_box.setFixedWidth(550)   # <<< key: tune once, stays perfect
         center_box_layout = QtWidgets.QHBoxLayout(center_box)
         center_box_layout.setContentsMargins(0, 0, 0, 0)
         center_box_layout.setSpacing(8)
@@ -459,6 +466,7 @@ class MainWindow(QtWidgets.QWidget):
         right_grp.setSpacing(0)
         right_grp.addWidget(self.btn_loop)
         right_grp.addWidget(self.spin_pause)
+        right_grp.addWidget(self.edit_jump)
 
         # --- assemble ---
         center_box_layout.addLayout(left_grp)
@@ -601,6 +609,7 @@ class MainWindow(QtWidgets.QWidget):
         self.loop_timer.setInterval(800)
         self.loop_timer.timeout.connect(self._advance_or_stop)
         self.btn_loop.toggled.connect(self.toggle_loop)
+        self.edit_jump.returnPressed.connect(self._jump_to_index)
 
         def _apply_pause():
             self.loop_timer.setInterval(int(self.spin_pause.value() * 1000))
@@ -794,6 +803,22 @@ class MainWindow(QtWidgets.QWidget):
         cam = pv.Camera()
         cam.SetParallelProjection(True)    # orthographic, like TurntableCamera fov=0
         return cam
+
+    def _jump_to_index(self):
+        if self.num_frames == 0:
+            return
+
+        txt = self.edit_jump.text().strip()
+        if not txt.isdigit():
+            return
+
+        idx = int(txt) - 1   # user sees 1-based indexing
+        if 0 <= idx < self.num_frames:
+            self.idx = idx
+            self.update_frame()
+
+        self.edit_jump.clear()
+        self.setFocus(QtCore.Qt.OtherFocusReason)  # ← restore arrow-key nav
 
     def toggle_loop(self, checked: bool):
         if checked and self.num_frames > 0:

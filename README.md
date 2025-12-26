@@ -7,7 +7,7 @@ This tool is designed for workflows where you want to compare **two different me
 - an **original** point cloud (input/output)
 - an **annotation** point cloud (ground truth / labels / recolored semantics)
 
-It supports **1–4 folders**, automatically builds a consistent frame list by **matching files by basename**, and keeps all view panes synchronized with a **linked orthographic camera**.
+It supports **1–4 paired folders**, automatically builds a consistent frame list by **matching files by basename**, and keeps all view panes synchronized with a **linked orthographic camera**.
 
 ![overview](assets/overview_01.png)
 
@@ -75,6 +75,8 @@ It uses:
   - Slider updates all panes continuously
 - **Loop mode**
   - Automatically cycles frames at a configurable delay
+- **Jump to text box**
+  - Jumps to the point cloud index number
 - **Session persistence**
   - Remembers last selected folders and last viewed index
 
@@ -104,9 +106,9 @@ A common usage is to compare **two methods**, where each method has **Original**
 Example:
 
 - Folder 0: `.../MethodA/Original`
-- Folder 1: `.../MethodA/Annotation`
+- Folder 1 (0 pair): `.../MethodA/Annotation`
 - Folder 2: `.../MethodB/Original`
-- Folder 3: `.../MethodB/Annotation`
+- Folder 3 (2 pair): `.../MethodB/Annotation`
 
 When used this way, the 2×2 view acts as:
 
@@ -230,7 +232,7 @@ python .\app.py
 Then:
 
 1. Click **Folders…**
-2. Multi-select **1–4 folders** (see “Recommended folder structure” above)
+2. Multi-select **pair folders** (see “Recommended folder structure” above)
 3. Use **Next ▶** / **◀ Prev** or **→ / ←** to navigate
 
 ### 6.2 Run with folders (CLI)
@@ -243,7 +245,7 @@ python .\app.py --folders "D:\data\MethodA\Original" "D:\data\MethodA\Annotation
 
 Notes:
 
-- You can pass 1–4 folders.
+- You can pass pair folders.
 - Only the **first four** are used.
 
 ---
@@ -286,6 +288,7 @@ Loop behavior:
 
 - Next frame: **Right Arrow (→)** or **Next ▶**
 - Previous frame: **Left Arrow (←)** or **◀ Prev**
+- Jump to index: Enter point cloud index number to jump
 
 ### 8.2 View / camera
 
@@ -441,7 +444,7 @@ Fix:
 This folder contains:
 
 - [app.py](python/app.py) — Main PyQt5 + PyVista point cloud compare viewer
-- [Point Cloud Compare.exe](<installer/Point Cloud Compare.exe>) — point cloud compare viewer installer
+- [Point Cloud Compare.exe](installer/Point Cloud Compare.exe) — point cloud compare viewer installer
 - `app.ico`, `icon.png` — Optional icons for packaging/window icon
 
 ---

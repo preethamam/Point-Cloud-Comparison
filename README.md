@@ -79,6 +79,11 @@ It uses:
   - Jumps to the point cloud index number
 - **Session persistence**
   - Remembers last selected folders and last viewed index
+- **Left navigation pane**
+  - Displays the thumbnails for quick access through the point clouds
+  - Highlights visited point cloud thumbnails in light blue color
+  - Search functionality to quickly look for a point cloud
+  - Toggle navigation button (hamburger icon)
 
 ---
 
@@ -289,6 +294,7 @@ Loop behavior:
 - Next frame: **Right Arrow (→)** or **Next ▶**
 - Previous frame: **Left Arrow (←)** or **◀ Prev**
 - Jump to index: Enter point cloud index number to jump
+- Left navigation pane (Toggle navigation (N))
 
 ### 8.2 View / camera
 

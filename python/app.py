@@ -7,22 +7,26 @@
 # • Titles as QLabels (no clipping)
 # • Linked orthographic cameras, top-down XY view
 
+import argparse
+import glob
+import hashlib
+import json
 import os
 import sys
-import glob
-import argparse
-import json
+import threading
 from functools import lru_cache
-from typing import List, Tuple, Dict
 from pathlib import Path
+from typing import Dict, List, Tuple
 
-from appdirs import user_data_dir
 import numpy as np
 import open3d as o3d
+import pyvista as pv
+from appdirs import user_data_dir
+from joblib import Parallel, delayed
 from natsort import natsorted
+from PIL import Image
 from PyQt5 import QtCore, QtGui, QtWidgets
 from pyvistaqt import QtInteractor
-import pyvista as pv
 
 # ────────── DEFAULT FOLDERS (yours) ──────────
 DEFAULT_FOLDERS = []
@@ -34,7 +38,7 @@ DEFAULT_FOLDERS = []
 # ]
 
 # ────────── Constants ──────────
-POINT_SIZE = 2.8  # initial point size in pixels
+POINT_SIZE = 3.8  # initial point size in pixels
 TIME_PAUSE = 1.5  # seconds between frames during Loop
 APP_ICON = "app.ico"  # place app.ico next to this script or give an absolute path
 STATE_JSON = "viewer_state.json"
@@ -45,6 +49,12 @@ state_dir = Path(user_data_dir(APP_NAME, appauthor=False))
 state_dir.mkdir(parents=True, exist_ok=True)
 STATE_JSON = os.path.join(state_dir, STATE_JSON)
 
+THUMB_MAX_PTS = 150_000   # reviewer-style cap
+THUMB_SIZE = 96
+NAV_WIDTH = 148  # you can tune this
+NAV_NAME_MAX = 20   # adjust to taste
+THUMB_DIR = os.path.join(state_dir, "thumbs")
+os.makedirs(THUMB_DIR, exist_ok=True)
 # ────────── File discovery & alignment ──────────
 
 def list_pc_files(folder: str) -> List[str]:
@@ -78,12 +88,31 @@ def align_pair(fA: str, fB: str) -> Tuple[List[str], List[str]]:
     common = natsorted(set(mA.keys()) & set(mB.keys()))
     return [mA[k] for k in common], [mB[k] for k in common]
 
+def align_all_by_basename(folder_paths: List[str]) -> Tuple[List[List[str]], int]:
+    """
+    Align N folders by global basename intersection (case-insensitive).
+    Guarantees that index i refers to the SAME filename in all panes.
+    """
+    all_lists = [list_pc_files(f) for f in folder_paths]
+    if any(len(L) == 0 for L in all_lists):
+        return [], 0
+
+    maps = [map_by_basename(L) for L in all_lists]
+    common = set(maps[0].keys())
+    for m in maps[1:]:
+        common &= set(m.keys())
+
+    common = natsorted(common)
+    if not common:
+        return [], 0
+
+    aligned = [[m[k] for k in common] for m in maps]
+    return aligned, len(common)
+
 def align_file_sets(folder_paths: List[str]) -> Tuple[List[List[str]], int]:
     """
-    1 folder  -> that list
-    2 folders -> pairwise aligned (0↔1)
-    3 folders -> (0↔1) aligned; 2nd pair absent; truncate to len(pair1)
-    4 folders -> (0↔1) and (2↔3) aligned; overall length = min(len(pair1), len(pair2))
+    1 folder  -> simple listing
+    2–4 folders -> globally aligned by basename intersection
     """
     k = len(folder_paths)
     if k == 0:
@@ -93,22 +122,63 @@ def align_file_sets(folder_paths: List[str]) -> Tuple[List[List[str]], int]:
         L0 = list_pc_files(folder_paths[0])
         return [L0], len(L0)
 
-    if k == 2:
-        L0, L1 = align_pair(folder_paths[0], folder_paths[1])
-        n = min(len(L0), len(L1))
-        return [L0[:n], L1[:n]], n
+    # 🔥 FIX: global alignment across ALL folders
+    aligned, n = align_all_by_basename(folder_paths[:4])
+    return aligned, n
 
-    if k == 3:
-        L0, L1 = align_pair(folder_paths[0], folder_paths[1])
-        L2 = list_pc_files(folder_paths[2])
-        n = min(len(L0), len(L1), len(L2))
-        return [L0[:n], L1[:n], L2[:n]], n
+def _thumb_key(path: str) -> str:
+    st = os.stat(path)
+    h = hashlib.md5(
+        f"{path}|{st.st_mtime_ns}|{st.st_size}".encode()
+    ).hexdigest()
+    return h + ".png"
 
-    # k >= 4 → use first four
-    L0, L1 = align_pair(folder_paths[0], folder_paths[1])
-    L2, L3 = align_pair(folder_paths[2], folder_paths[3])
-    n = min(len(L0), len(L1), len(L2), len(L3))
-    return [L0[:n], L1[:n], L2[:n], L3[:n]], n
+def _thumb_path_for(pc_path: str) -> str:
+    return os.path.join(THUMB_DIR, _thumb_key(pc_path))
+
+
+def generate_thumbnail(pc_path: str, out_png: str, size_px: int = THUMB_SIZE):
+    try:
+        pc = o3d.io.read_point_cloud(pc_path)
+        if pc.is_empty():
+            return False
+
+        xyz = np.asarray(pc.points)
+        rgb = np.asarray(pc.colors) if pc.has_colors() else None
+
+        if xyz.shape[0] > THUMB_MAX_PTS:
+            idx = np.random.choice(xyz.shape[0], THUMB_MAX_PTS, replace=False)
+            xyz = xyz[idx]
+            if rgb is not None:
+                rgb = rgb[idx]
+
+        if rgb is None or rgb.shape[0] != xyz.shape[0]:
+            rgb = np.ones((xyz.shape[0], 3), np.float32)
+
+        if rgb.max() > 1.0:
+            rgb = np.clip(rgb / 255.0, 0, 1)
+
+        x, y, z = xyz[:, 0], xyz[:, 1], xyz[:, 2]
+
+        xmin, xmax = x.min(), x.max()
+        ymin, ymax = y.min(), y.max()
+
+        dx = max(xmax - xmin, 1e-12)
+        dy = max(ymax - ymin, 1e-12)
+
+        W = H = size_px
+        ix = ((x - xmin) / dx * (W - 1)).astype(np.int32)
+        iy = ((y - ymin) / dy * (H - 1)).astype(np.int32)
+
+        img = np.full((H, W, 3), 255, np.uint8)
+
+        order = np.argsort(z)
+        img[H - 1 - iy[order], ix[order]] = (rgb[order] * 255).astype(np.uint8)
+
+        Image.fromarray(img).save(out_png)
+        return True
+    except Exception:
+        return False
 
 # ────────── Point cloud IO (cached) ──────────
 @lru_cache(maxsize=96)
@@ -139,6 +209,40 @@ def load_cloud(path: str):
     alpha = np.ones((cols.shape[0], 1), dtype=np.float32)
     cols = np.concatenate([cols, alpha], axis=1)
     return pts, cols
+
+class NavPane(QtWidgets.QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumWidth(220)
+
+        v = QtWidgets.QVBoxLayout(self)
+        v.setContentsMargins(4, 4, 4, 4)
+
+        # search
+        self.search = QtWidgets.QLineEdit()
+        self.search.setPlaceholderText("Search / filter (name)")
+        self.search.setClearButtonEnabled(True)
+        v.addWidget(self.search)
+
+        # list
+        self.list = QtWidgets.QListWidget()
+        self.list.setViewMode(QtWidgets.QListView.IconMode)
+        self.list.setResizeMode(QtWidgets.QListView.Adjust)
+        self.list.setWrapping(True)
+        self.list.setVerticalScrollMode(
+            QtWidgets.QAbstractItemView.ScrollPerPixel
+        )
+
+
+        self.list.setIconSize(QtCore.QSize(THUMB_SIZE, THUMB_SIZE))
+        self.list.setGridSize(QtCore.QSize(THUMB_SIZE + 24, THUMB_SIZE + 40))
+        self.list.setMovement(QtWidgets.QListView.Static)
+        self.list.setSpacing(6)
+        self.list.setWordWrap(True)
+        self.list.setTextElideMode(QtCore.Qt.ElideMiddle)
+        self.list.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.list.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        v.addWidget(self.list, 1)        
 
 # ────────── PyVista canvas widget ──────────
 class CloudPane(QtWidgets.QWidget):
@@ -369,6 +473,7 @@ class MainWindow(QtWidgets.QWidget):
         self.setWindowTitle("Point Cloud Compare")
         self.folders = [os.path.abspath(f) for f in folder_paths[:4]]
         self.idx = 0
+        self._seen = set()
 
         # Load from JSON if no folders given on CLI
         if not self.folders:
@@ -380,11 +485,38 @@ class MainWindow(QtWidgets.QWidget):
             self.idx = max(0, min(self.idx, self.num_frames - 1)) if self.num_frames > 0 else 0
         else:
             self.file_lists, self.num_frames = [], 0
-
+            
         self.point_size = POINT_SIZE
+        self._thumbs_generating = False    
+        self._thumb_out_by_row = {}
+        self._thumb_sweep_timer = None
+        
+        self.thumb_timer = QtCore.QTimer(self)
+        self.thumb_timer.setInterval(200)  # ms
+        self.thumb_timer.timeout.connect(self._refresh_nav_icons)
 
         # ── Top bar: [left zone] … center zone … [right zone]
         root = QtWidgets.QVBoxLayout(self)
+                
+        self.splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        root.addWidget(self.splitter, 1)
+        
+        self.status = QtWidgets.QStatusBar()
+        self.status.setSizeGripEnabled(False)
+        root.addWidget(self.status)
+
+        # --- nav pane ---
+        self.nav = NavPane(self)
+        self.nav.setMinimumWidth(NAV_WIDTH)
+        self.nav.setMaximumWidth(NAV_WIDTH)                            
+        self.splitter.addWidget(self.nav)
+        self.splitter.setChildrenCollapsible(False)
+
+        # --- main content ---
+        self.main_widget = QtWidgets.QWidget()
+        self.splitter.addWidget(self.main_widget)
+
+        root = QtWidgets.QVBoxLayout(self.main_widget)
 
         # use a 3-column grid so the center column is truly centered
         top = QtWidgets.QGridLayout()
@@ -392,19 +524,25 @@ class MainWindow(QtWidgets.QWidget):
 
         # LEFT (frame + filename)
         left = QtWidgets.QHBoxLayout()
+        
+        self.btn_nav = QtWidgets.QPushButton("☰")
+        self.btn_nav.setFixedWidth(28)
+        self.btn_nav.setToolTip("Toggle navigation (N)")
+        self.btn_nav.setCheckable(True)
+        self.btn_nav.setChecked(True)
+        self.btn_nav.setFocusPolicy(QtCore.Qt.NoFocus)
+        left.insertWidget(1, self.btn_nav)
+        left.addSpacing(0)
+
         # NEW: Folders… button (kept lightweight; selects 4 folders)
         self.btn_folders = QtWidgets.QPushButton("Folders…")
         self.btn_folders.setFixedWidth(84)
         self.btn_folders.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
-        left.addSpacing(12)
+        left.addSpacing(0)
         left.addWidget(self.btn_folders)
 
         self.lbl_idx = QtWidgets.QLabel(self._idx_text())
-        self.lbl_name = QtWidgets.QLabel("")
-        self.lbl_name.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
-        left.addWidget(self.lbl_idx)
-        left.addSpacing(12)
-        left.addWidget(self.lbl_name)
+        self.lbl_name = QtWidgets.QLabel("") 
 
         self.view_combo = QtWidgets.QComboBox()
         self.view_combo.addItems([
@@ -444,30 +582,12 @@ class MainWindow(QtWidgets.QWidget):
         self.edit_jump.setClearButtonEnabled(True)
         self.edit_jump.setFocusPolicy(QtCore.Qt.ClickFocus)
 
-        # CENTER (fixed-width optical center)
-        center = QtWidgets.QHBoxLayout()
-        center.setContentsMargins(0, 0, 0, 0)
-
-        # ---- fixed-width container ----
-        center_box = QtWidgets.QWidget()
-        center_box.setFixedWidth(550)   # <<< key: tune once, stays perfect
-        center_box_layout = QtWidgets.QHBoxLayout(center_box)
-        center_box_layout.setContentsMargins(0, 0, 0, 0)
-        center_box_layout.setSpacing(8)
-
         # --- center group: view + reset + loop + seconds + jump in box---
-        center_group = QtWidgets.QHBoxLayout()
-        center_group.setSpacing(0)
-        center_group.addWidget(self.view_combo)
-        center_group.addWidget(self.btn_reset)
-        center_group.addWidget(self.btn_loop)
-        center_group.addWidget(self.spin_pause)
-        center_group.addWidget(self.edit_jump)
-
-        # --- assemble ---
-        center_box_layout.addLayout(center_group)
-
-        center.addWidget(center_box, alignment=QtCore.Qt.AlignHCenter)
+        left.addWidget(self.view_combo)
+        left.addWidget(self.btn_reset)
+        left.addWidget(self.btn_loop)
+        left.addWidget(self.spin_pause)
+        left.addWidget(self.edit_jump)
 
         # RIGHT (point size + slider + prev/next)
         right = QtWidgets.QHBoxLayout()
@@ -502,15 +622,23 @@ class MainWindow(QtWidgets.QWidget):
 
         self.btn_prev = QtWidgets.QPushButton("◀ Prev")
         self.btn_next = QtWidgets.QPushButton("Next ▶")
+        self.btn_nav.clicked.connect(self.toggle_nav)
+        
+        self.btn_del_thumbs = QtWidgets.QPushButton("Delete Thumbnails")
+        self.btn_del_thumbs.setToolTip("Delete cached thumbnails")
+        self.btn_del_thumbs.setFixedWidth(100)
+        self.btn_del_thumbs.setFocusPolicy(QtCore.Qt.NoFocus)
+
         for b in (self.btn_prev, self.btn_next):
             b.setFixedWidth(86)
             b.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Preferred)
         right.addWidget(self.btn_prev)
         right.addWidget(self.btn_next)
+        right.addWidget(self.btn_del_thumbs)
+
 
         # --- place into the grid (center stays geometrically centered)
         top.addLayout(left,   0, 0, alignment=QtCore.Qt.AlignLeft)
-        top.addLayout(center, 0, 1, alignment=QtCore.Qt.AlignHCenter)
         top.addLayout(right,  0, 2, alignment=QtCore.Qt.AlignRight)
 
         # keep side columns elastic; middle column fixed to its sizeHint
@@ -526,6 +654,12 @@ class MainWindow(QtWidgets.QWidget):
         self.grid.setRowStretch(1, 1)
         self.grid.setColumnStretch(0, 1)
         self.grid.setColumnStretch(1, 1)
+        
+        # ── Connections & shortcuts ──        
+        self.nav.list.itemClicked.connect(
+            lambda it: self._jump_from_nav(it)
+        )
+        self.nav.list.currentRowChanged.connect(self._jump_from_nav_row)
         
         # --- View shortcuts (Ctrl+T / Ctrl+B / Ctrl+I) ---
         sc_top = QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+T"), self)
@@ -568,6 +702,16 @@ class MainWindow(QtWidgets.QWidget):
         sc_neiso.setContext(QtCore.Qt.ApplicationShortcut)
         sc_neiso.activated.connect(lambda: self.view_combo.setCurrentIndex(9))
         
+        QtWidgets.QShortcut(
+            QtGui.QKeySequence("Ctrl+Q"),
+            self,
+            activated=self.close
+        )
+        
+        sc_nav = QtWidgets.QShortcut(QtGui.QKeySequence("N"), self)
+        sc_nav.setContext(QtCore.Qt.ApplicationShortcut)
+        sc_nav.activated.connect(self._toggle_nav_from_shortcut)
+
         # --- Panes ---
         shared_cam = pv.Camera()
         shared_cam.SetParallelProjection(True)
@@ -587,6 +731,11 @@ class MainWindow(QtWidgets.QWidget):
         for p in self.panes:
             p.plotter.interactor.installEventFilter(self)
 
+        self.nav.search.setFocusPolicy(QtCore.Qt.ClickFocus)
+        self.nav.search.textChanged.connect(self._filter_nav_items)
+        self.nav.search.installEventFilter(self)
+        self.nav.list.installEventFilter(self)
+
         # prevent arrow keys from landing on controls
         for w in (self.btn_prev, self.btn_next, self.btn_reset, self.view_combo, self.btn_loop):
             w.setFocusPolicy(QtCore.Qt.NoFocus)
@@ -594,6 +743,8 @@ class MainWindow(QtWidgets.QWidget):
         # ── Signals
         self.btn_prev.clicked.connect(self.prev_frame)
         self.btn_next.clicked.connect(self.next_frame)
+        self.btn_del_thumbs.clicked.connect(self.delete_thumbnails)
+
         self.slider.valueChanged.connect(self.on_size_changed)
         self.view_combo.currentIndexChanged.connect(self.on_view_mode_changed)
         self.btn_reset.clicked.connect(self.reset_view)
@@ -626,10 +777,234 @@ class MainWindow(QtWidgets.QWidget):
         # Initial frame
         self.update_frame()
 
+    def _jump_from_nav_row(self, row: int):
+        # Called when user moves selection with keyboard (Up/Down)
+        if row < 0 or row == self.idx:
+            return
+
+        self.idx = row
+        self.update_frame()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+
+        # Ensure splitter respects fixed nav width once geometry is known
+        if self.splitter.count() >= 2:
+            total = self.splitter.width()
+            self.splitter.setSizes([NAV_WIDTH, max(1, total - NAV_WIDTH)])
+
+    def _filter_nav_items(self, text: str):
+        """
+        Filter LEFT navigation items by:
+        - index (e.g. '12', '0012')
+        - filename
+        """
+        text = text.strip().lower()
+
+        if not self.file_lists:
+            return
+
+        files = self.file_lists[0]
+
+        for row in range(self.nav.list.count()):
+            item = self.nav.list.item(row)
+            path = files[row]
+
+            # index match (reviewer-style)
+            idx_str = f"{row+1:04d}"
+
+            # filename match (full name, not truncated)
+            fname = os.path.basename(path).lower()
+
+            visible = (
+                not text or
+                text in idx_str or
+                text in fname
+            )
+
+            item.setHidden(not visible)
+
+        # ensure current frame remains visible
+        if 0 <= self.idx < self.nav.list.count():
+            cur_item = self.nav.list.item(self.idx)
+            if cur_item and not cur_item.isHidden():
+                self.nav.list.scrollToItem(cur_item)
+
+    def _toggle_nav_from_shortcut(self):
+        # Toggle the button state explicitly
+        self.btn_nav.setChecked(not self.btn_nav.isChecked())
+        self.toggle_nav()
+
+    def toggle_nav(self):
+        if self.nav.isVisible():
+            self._nav_last_width = self.nav.width()
+            self.nav.hide()
+        else:
+            self.nav.show()
+            w = getattr(self, "_nav_last_width", NAV_WIDTH)
+            self.nav.setFixedWidth(w)
+            
+        # 🔥 critical: refit after splitter geometry change
+        QtCore.QTimer.singleShot(0, self._refit_after_resize)
+    
+    def _sync_nav_selection(self):
+        """Ensure LEFT nav selection follows current index."""
+        if not self.nav.list.count():
+            return
+
+        row = self.idx
+        if 0 <= row < self.nav.list.count():
+            self.nav.list.setCurrentRow(row)
+            self.nav.list.scrollToItem(
+                self.nav.list.item(row),
+                QtWidgets.QAbstractItemView.PositionAtCenter
+            )
+
+    def populate_nav(self):
+        self.nav.list.clear()
+        self._seen = set()
+
+        if not self.file_lists:
+            return
+
+        files = self.file_lists[0]  # reference list
+
+        for i, p in enumerate(files):
+            name_full = os.path.basename(p)
+            name_disp = (
+                name_full[:NAV_NAME_MAX - 1] + "…"
+                if len(name_full) > NAV_NAME_MAX
+                else name_full
+            )
+
+            idx_txt = f"{i+1:04d}"
+
+            item = QtWidgets.QListWidgetItem(f"{idx_txt}\n{name_disp}")
+            item.setToolTip(name_full)
+
+            item.setTextAlignment(QtCore.Qt.AlignHCenter | QtCore.Qt.AlignBottom)
+            item.setData(QtCore.Qt.UserRole, i)
+            self.nav.list.addItem(item)
+       
+        # --- enqueue thumbnails (reviewer-style realtime) ---
+        self._thumb_out_by_row.clear()
+        jobs = []
+
+        files = self.file_lists[0]
+
+        for row, p in enumerate(files):
+            out_png = _thumb_path_for(p)
+            self._thumb_out_by_row[row] = out_png
+
+            if not os.path.exists(out_png):
+                jobs.append((p, out_png))
+
+        if jobs and not self._thumbs_generating:
+            self._thumbs_generating = True
+
+            def worker(j=jobs):
+                try:
+                    Parallel(
+                        n_jobs=-1,
+                        backend="threading",   # GUI-safe
+                        verbose=0
+                    )(
+                        delayed(generate_thumbnail)(p, out)
+                        for p, out in j
+                    )
+                finally:
+                    self._thumbs_generating = False
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        # start sweeper
+        if self._thumb_sweep_timer is None:
+            self._thumb_sweep_timer = QtCore.QTimer(self)
+            self._thumb_sweep_timer.timeout.connect(self._sweep_thumb_icons)
+
+        self._thumb_sweep_timer.start(120)
+        QtCore.QTimer.singleShot(0, self._sync_nav_selection)
+
+    def _sweep_thumb_icons(self):
+        if not self._thumb_out_by_row:
+            self._thumb_sweep_timer.stop()
+            return
+
+        rows = list(self._thumb_out_by_row.keys())
+        batch = 80
+        updated = False
+
+        for _ in range(batch):
+            if not rows:
+                break
+
+            r = rows[0]
+            out_png = self._thumb_out_by_row.get(r)
+
+            if out_png and os.path.exists(out_png):
+                it = self.nav.list.item(r)
+                if it is not None:
+                    it.setIcon(QtGui.QIcon(out_png))
+                    updated = True
+
+                self._thumb_out_by_row.pop(r, None)
+                rows.pop(0)
+            else:
+                rows.append(rows.pop(0))
+
+        if not self._thumb_out_by_row:
+            self._thumb_sweep_timer.stop()
+
+        if updated:
+            self.nav.list.viewport().update()      
+        
+    def _refresh_nav_icons(self):
+        all_done = True
+
+        for i in range(self.nav.list.count()):
+            it = self.nav.list.item(i)
+            p = self.file_lists[0][i]
+            tp = _thumb_path_for(p)
+
+            if os.path.exists(tp):
+                if it.icon().isNull():
+                    it.setIcon(QtGui.QIcon(tp))
+            else:
+                all_done = False
+
+        if all_done:
+            self.thumb_timer.stop()
+
     def eventFilter(self, obj, event):
+        if event.type() == QtCore.QEvent.KeyPress:
+
+            # ⬅️⬅️ FIX: arrow keys while nav list has focus
+            if obj is self.nav.list:
+                if event.key() == QtCore.Qt.Key_Right:
+                    self.next_frame()
+                    return True
+                elif event.key() == QtCore.Qt.Key_Left:
+                    self.prev_frame()
+                    return True
+
+            fw = QtWidgets.QApplication.focusWidget()
+
+            if fw is self.nav.search:
+                if event.key() == QtCore.Qt.Key_Left:
+                    self.prev_frame()
+                    return True
+                elif event.key() == QtCore.Qt.Key_Right:
+                    self.next_frame()
+                    return True
+                elif event.key() == QtCore.Qt.Key_Escape:
+                    self.nav.search.clear()
+                    self.setFocus(QtCore.Qt.OtherFocusReason)
+                    return True
+
         if event.type() == QtCore.QEvent.Wheel:
             self._on_wheel(event, obj)
-            return True   # block PyVista default zoom
+            return True
+
         return super().eventFilter(obj, event)
 
     def _on_wheel(self, event, interactor):
@@ -747,6 +1122,9 @@ class MainWindow(QtWidgets.QWidget):
         self.folders = [os.path.abspath(f) for f in folders[:4]]
         self.file_lists, self.num_frames = align_file_sets(self.folders)
 
+        if self.num_frames > 0:
+            self.populate_nav()
+            
         # --- rebuild panes if count changed (handles 0 → N and N → M)
         new_nviews = len(self.file_lists)
 
@@ -828,6 +1206,71 @@ class MainWindow(QtWidgets.QWidget):
         self.idx = (self.idx + 1) % self.num_frames
         self.update_frame()
 
+    def _lock_clipping_range(self):
+        cam = self.shared_cam
+        fp = np.array(cam.GetFocalPoint())
+        pos = np.array(cam.GetPosition())
+        dist = np.linalg.norm(pos - fp)
+
+        # Conservative, stable clipping range
+        near = max(dist * 0.001, 1e-6)
+        far  = dist * 10.0
+
+        cam.SetClippingRange(near, far)
+
+    def _ortho_scale_from_bbox(self, cam, mn, mx, aspect, pad=1.03):
+        """
+        Compute ParallelScale for an orthographic camera by projecting
+        the 3D bounding box onto the camera view plane.
+        """
+        # 8 corners of bounding box
+        corners = np.array([
+            [mn[0], mn[1], mn[2]],
+            [mn[0], mn[1], mx[2]],
+            [mn[0], mx[1], mn[2]],
+            [mn[0], mx[1], mx[2]],
+            [mx[0], mn[1], mn[2]],
+            [mx[0], mn[1], mx[2]],
+            [mx[0], mx[1], mn[2]],
+            [mx[0], mx[1], mx[2]],
+        ], dtype=float)
+
+        # Camera basis
+        pos = np.array(cam.GetPosition())
+        fp  = np.array(cam.GetFocalPoint())
+        up  = np.array(cam.GetViewUp())
+        view_dir = fp - pos
+        view_dir /= np.linalg.norm(view_dir)
+
+        right = np.cross(view_dir, up)
+        right /= np.linalg.norm(right)
+        up = np.cross(right, view_dir)
+
+        # Project corners into camera plane
+        rel = corners - fp
+        x = rel @ right
+        y = rel @ up
+
+        w = x.max() - x.min()
+        h = y.max() - y.min()
+
+        return 0.5 * max(h, w / aspect) * pad
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+
+        # Defer refit until Qt layout settles (critical)
+        QtCore.QTimer.singleShot(0, self._refit_after_resize)
+        
+    def _refit_after_resize(self):
+        if self.num_frames == 0 or not self.panes:
+            return
+
+        self._fit_all_to_data()
+
+        for p in self.panes:
+            p.plotter.render()
+
     def _fit_all_to_data(self):
         mins, maxs = [], []
         for p in self.panes:
@@ -842,86 +1285,98 @@ class MainWindow(QtWidgets.QWidget):
         mn = np.min(np.vstack(mins), axis=0)
         mx = np.max(np.vstack(maxs), axis=0)
 
-        cx, cy, cz = center = (mn + mx) * 0.5
-        dx, dy, dz = mx - mn
+        cx, cy, cz = (mn + mx) * 0.5
+        dx, dy, dz = (mx - mn)
+        
+        # Defensive defaults (prevents UnboundLocalError)
+        plane_w = float(dx)
+        plane_h = float(dy)
 
-        diag = np.linalg.norm([dx, dy, dz]) or 1.0
-        dist = diag * 1.3      # comfortable camera distance
-        scale = diag * 0.38    # matches VisPy VIEW_PAD = 0.75
+        # Comfortable camera distance (still fine to use 3D diagonal)
+        diag = float(np.linalg.norm([dx, dy, dz]) or 1.0)
+        dist = diag * 1.3
 
         cam = self.shared_cam
         mode = self.view_combo.currentText()
+        mode = mode.split()[0]   # "SW Isometric view (...)" → "SW"
 
-        # always center camera on the data
         cam.SetFocalPoint(cx, cy, cz)
 
+        # --- determine view direction + view-plane extents (for tight ortho fit) ---
         if mode.startswith("Top"):
-            # Top view: look DOWN -Z
             cam.SetPosition(cx, cy, cz + dist)
             cam.SetViewUp(0, 1, 0)
-            cam.SetParallelProjection(True)
+            plane_w, plane_h = float(dx), float(dy)
 
         elif mode.startswith("Bottom"):
-            # Bottom view: look UP +Z
             cam.SetPosition(cx, cy, cz - dist)
             cam.SetViewUp(0, 1, 0)
-            cam.SetParallelProjection(True)
-            
+            plane_w, plane_h = float(dx), float(dy)
+
         elif mode.startswith("Front"):
-            # Front view: look +Y
             cam.SetPosition(cx, cy - dist, cz)
             cam.SetViewUp(0, 0, 1)
-            cam.SetParallelProjection(True)
-            
+            plane_w, plane_h = float(dx), float(dz)
+
         elif mode.startswith("Back"):
-            # Back view: look -Y
             cam.SetPosition(cx, cy + dist, cz)
             cam.SetViewUp(0, 0, 1)
-            cam.SetParallelProjection(True)
-            
+            plane_w, plane_h = float(dx), float(dz)
+
         elif mode.startswith("Left"):
-            # Left view: look -X
             cam.SetPosition(cx - dist, cy, cz)
             cam.SetViewUp(0, 0, 1)
-            cam.SetParallelProjection(True)
-            
+            plane_w, plane_h = float(dy), float(dz)
+
         elif mode.startswith("Right"):
-            # Right view: look +X
             cam.SetPosition(cx + dist, cy, cz)
             cam.SetViewUp(0, 0, 1)
-            cam.SetParallelProjection(True)
+            plane_w, plane_h = float(dy), float(dz)
 
-        elif mode.startswith("SW"):
-            # SOUTH-WEST isometric (-X, -Y, +Z)
-            cam.SetPosition(cx - dist, cy - dist, cz + dist)
-            cam.SetViewUp(0, 0, 1)
-            cam.SetParallelProjection(True)
-                        
-        elif mode.startswith("SE"):
-            # SOUTH-EAST isometric (+X, -Y, +Z)
-            cam.SetPosition(cx + dist, cy - dist, cz + dist)
-            cam.SetViewUp(0, 0, 1)
-            cam.SetParallelProjection(True)
-            
-        elif mode.startswith("NW"):
-            # NORTH-WEST isometric (-X, +Y, +Z)
-            cam.SetPosition(cx - dist, cy + dist, cz + dist)
-            cam.SetViewUp(0, 0, 1)
-            cam.SetParallelProjection(True)
-            
-        elif mode.startswith("NE"):
-            # NORTH-EAST isometric (+X, +Y, +Z)
-            cam.SetPosition(cx + dist, cy + dist, cz + dist)
+        else:
+            # --- Isometric views: exact orthographic fit via bbox projection ---
+            if mode.startswith("SW"):
+                cam.SetPosition(cx - dist, cy - dist, cz + dist)
+            elif mode.startswith("SE"):
+                cam.SetPosition(cx + dist, cy - dist, cz + dist)
+            elif mode.startswith("NW"):
+                cam.SetPosition(cx - dist, cy + dist, cz + dist)
+            elif mode.startswith("NE"):
+                cam.SetPosition(cx + dist, cy + dist, cz + dist)
+
             cam.SetViewUp(0, 0, 1)
             cam.SetParallelProjection(True)
 
-        cam.SetParallelProjection(True)
-        cam.SetParallelScale(scale)
+            # viewport aspect
+            aspect = 1.0
+            if self.panes:
+                wpx, hpx = self.panes[0].plotter.window_size
+                if hpx:
+                    aspect = wpx / hpx
+
+            scale = self._ortho_scale_from_bbox(cam, mn, mx, aspect, pad=1.03)
+            cam.SetParallelScale(scale)
+
+        # --- compute orthographic scale using viewport aspect ratio ---
+        aspect = 1.0
+        if self.panes:
+            wpx, hpx = self.panes[0].plotter.window_size
+            if hpx:
+                aspect = float(wpx) / float(hpx)
+
+        plane_w = max(plane_w, 1e-12)
+        plane_h = max(plane_h, 1e-12)
+
+        # ParallelScale is half the visible world-height; width constraint uses aspect
+        pad = 1.03  # small padding; tune 1.03–1.10
+        half_h_needed = 0.5 * max(plane_h, plane_w / max(aspect, 1e-6))
+        cam.SetParallelScale(half_h_needed * pad)
+
         cam.Modified()
 
-        for p in self.panes:
-            p.plotter.renderer.ResetCameraClippingRange()
-            p.plotter.render()
+        # IMPORTANT: don't render here (prevents “splash”)
+        self._lock_clipping_range()
+
 
     def reset_view(self):
         self._fit_all_to_data()
@@ -951,7 +1406,9 @@ class MainWindow(QtWidgets.QWidget):
             self.reset_view()
             return
         elif e.key() == QtCore.Qt.Key_Escape:
-            self.close()
+            # ESC = soft cancel only
+            self.nav.search.clear()
+            self.setFocus(QtCore.Qt.OtherFocusReason)
             return
         else:
             super().keyPressEvent(e)
@@ -969,56 +1426,113 @@ class MainWindow(QtWidgets.QWidget):
     def prev_frame(self):
         if self.num_frames == 0:
             return
+        self._seen.add(self.idx)
         self.idx = (self.idx - 1) % self.num_frames
         self.update_frame()
 
     def next_frame(self):
         if self.num_frames == 0:
             return
+        self._seen.add(self.idx)
         self.idx = (self.idx + 1) % self.num_frames
         self.update_frame()
 
-    def update_frame(self):        
+    def update_frame(self):
         if self.num_frames == 0 or not self.file_lists:
             self.lbl_idx.setText("Frame 0 / 0")
             self.lbl_name.setText("No folders selected")
             return
 
-        # Choose name from first pair’s file basename (aligned)
-        ref_name = os.path.basename(self.file_lists[0][self.idx])
-        self.lbl_idx.setText(self._idx_text())
-        self.lbl_name.setText(ref_name)
-
-        # 1) Load all clouds first (no rendering, no camera fit)
-        batch = []
-        for v_idx in range(len(self.panes)):
-            path = self.file_lists[v_idx][self.idx]
-            pts, cols = load_cloud(path)
-            batch.append((pts, cols))
-
-        # 2) Now update all panes only AFTER all bounding boxes are known
-        for v_idx, pane in enumerate(self.panes):
-            pane.set_title(os.path.basename(self.folders[v_idx]))
-            pts, cols = batch[v_idx]
-            pane.set_points(pts, cols, self.point_size)
-            pane.set_point_size(self.point_size)
-            
-        self._fit_all_to_data()
-        
-        # Render all panes ONCE (this prevents shrink-then-grow)
+        # Freeze Qt repaints for the VTK widgets (prevents splash/flicker)
         for p in self.panes:
-            p.plotter.render()
+            try:
+                p.plotter.interactor.setUpdatesEnabled(False)
+            except Exception:
+                pass
+
+        try:
+            ref_name = os.path.basename(self.file_lists[0][self.idx])
+            self.lbl_idx.setText(self._idx_text())
+            self.lbl_name.setText(ref_name)
+
+            self.setWindowTitle(f"{APP_NAME} — {ref_name}   ({self.idx + 1}/{self.num_frames})")
+            self.status.showMessage(f"Viewing: {ref_name}")
+
+            # 1) Load all clouds first
+            batch = []
+            for v_idx in range(len(self.panes)):
+                path = self.file_lists[v_idx][self.idx]
+                pts, cols = load_cloud(path)
+                batch.append((pts, cols))
+
+            # 2) Update all panes (no renders yet)
+            for v_idx, pane in enumerate(self.panes):
+                pane.set_title(os.path.basename(self.folders[v_idx]))
+                pts, cols = batch[v_idx]
+                pane.set_points(pts, cols, self.point_size)
+
+            # 3) Fit camera once (no renders inside)
+            self._fit_all_to_data()
+
+            # 4) Render once per pane (after everything is consistent)
+            for p in self.panes:
+                p.plotter.render()
+
+            self._seen.add(self.idx)
+            self._refresh_nav_styles()
+            self._save_state()
+            self._sync_nav_selection()
+
+        finally:
+            for p in self.panes:
+                try:
+                    p.plotter.interactor.setUpdatesEnabled(True)
+                except Exception:
+                    pass
     
-        self._save_state()
+    def _refresh_nav_styles(self):
+        for i in range(self.nav.list.count()):
+            it = self.nav.list.item(i)
+            if i in self._seen:
+                it.setBackground(QtGui.QColor("#d0e7ff"))
+            else:
+                it.setBackground(QtGui.QColor("white"))
+                
+    def _jump_from_nav(self, item):
+        idx = item.data(QtCore.Qt.UserRole)
+        if idx is not None:
+            self.idx = idx
+            self.update_frame()
+            self._sync_nav_selection()
         
     def closeEvent(self, event):
         for p in self.panes:
             p.close()  # gracefully destroy all VTK windows
         event.accept()
+        
+    def delete_thumbnails(self):
+        try:
+            if os.path.isdir(THUMB_DIR):
+                import shutil
+                shutil.rmtree(THUMB_DIR)
+                QtWidgets.QMessageBox.information(
+                    self, "Thumbnails Deleted",
+                    "Thumbnail cache has been deleted.\nRestart or reopen navigation to regenerate."
+                )
+            else:
+                QtWidgets.QMessageBox.information(
+                    self, "No Thumbnails",
+                    "No thumbnail cache folder found."
+                )
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(
+                self, "Error",
+                f"Failed to delete thumbnails:\n{e}"
+            )
+
 
 
 # ────────── CLI ──────────
-
 def build_argparser():
     ap = argparse.ArgumentParser(description="Fast PLY/PCD viewer (1–4 folders). Use Left/Right to navigate.")
     ap.add_argument("--folders", nargs="+", default=DEFAULT_FOLDERS,
@@ -1036,6 +1550,10 @@ def main():
         qapp.setWindowIcon(QtGui.QIcon(APP_ICON))
     win = MainWindow(folders)
     win.showMaximized()                                      # maximized
+    
+    # ⏱️ defer thumbnails until UI is alive
+    QtCore.QTimer.singleShot(0, win.populate_nav)
+
     win.raise_()
     win.activateWindow()                                     # focus to front
     win.show()

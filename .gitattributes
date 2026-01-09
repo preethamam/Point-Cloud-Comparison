@@ -1,1 +1,2 @@
 *.exe filter=lfs diff=lfs merge=lfs -text
+installer/Point[[:space:]]Cloud[[:space:]]Compare.exe filter=lfs diff=lfs merge=lfs -text
